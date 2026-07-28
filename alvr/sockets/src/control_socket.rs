@@ -1,4 +1,4 @@
-use crate::{CONTROL_PORT, LOCAL_IP};
+use crate::CONTROL_PORT;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result, con_bail};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use bincode::config;
@@ -20,7 +20,7 @@ pub fn bind(
     dscp: Option<DscpTos>,
     buffer_config: SocketBufferConfig,
 ) -> Result<TcpListener> {
-    let socket = TcpListener::bind((LOCAL_IP, port))?.into();
+    let socket = crate::bind_tcp_listener(port)?;
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
 
@@ -40,7 +40,7 @@ pub fn accept_from_server(
     let (socket, server_address) = listener.accept().handle_try_again()?;
 
     if let Some(ip) = server_ip
-        && server_address.ip() != ip
+        && !crate::same_ip(server_address.ip(), ip)
     {
         con_bail!(
             "Connected to wrong client: Expected: {ip}, Found {}",

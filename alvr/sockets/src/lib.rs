@@ -5,17 +5,16 @@ use alvr_common::{AnyhowToCon, ConResult, ToCon, anyhow::Result, con_bail, info}
 use alvr_packets::{ClientControlPacket, ServerControlPacket};
 use alvr_session::{DscpTos, SocketBufferConfig, SocketBufferSize, SocketProtocol};
 use serde::{Serialize, de::DeserializeOwned};
-use socket2::Socket;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     marker::PhantomData,
-    net::{IpAddr, Ipv4Addr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     time::Duration,
 };
 
 pub use control_socket::*;
 pub use stream_socket::*;
 
-pub const LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const CONTROL_PORT: u16 = 9943;
 pub const HANDSHAKE_PACKET_SIZE_BYTES: usize = 56; // this may change in future protocols
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
@@ -26,6 +25,74 @@ pub const MDNS_PROTOCOL_KEY: &str = "protocol";
 pub const MDNS_DEVICE_ID_KEY: &str = "device_id";
 
 pub const WIRED_CLIENT_HOSTNAME: &str = "client.wired";
+
+// Binds on the IPv6 unspecified address with IPV6_V6ONLY disabled, so the socket accepts both IPv6
+// peers and IPv4 peers (the latter appear as IPv4-mapped addresses, ::ffff:a.b.c.d). Windows
+// defaults the option to true and Linux/Android follow net.ipv6.bindv6only, so it is always set
+// explicitly. Hosts with IPv6 disabled fall back to the pre-existing IPv4-only bind.
+fn bind_dual_stack(port: u16, ty: Type, protocol: Protocol) -> Result<Socket> {
+    fn bind_v6(port: u16, ty: Type, protocol: Protocol) -> Result<Socket> {
+        let socket = Socket::new(Domain::IPV6, ty, Some(protocol))?;
+
+        // Must be set before bind, otherwise it has no effect.
+        socket.set_only_v6(false)?;
+
+        // std::net::TcpListener sets SO_REUSEADDR on non-Windows platforms. Mirror that, and
+        // deliberately don't set it on Windows where it allows socket hijacking.
+        if ty == Type::STREAM && !cfg!(windows) {
+            socket.set_reuse_address(true)?;
+        }
+
+        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
+
+        Ok(socket)
+    }
+
+    match bind_v6(port, ty, protocol) {
+        Ok(socket) => Ok(socket),
+        Err(e) => {
+            info!("Dual-stack bind on port {port} failed ({e}), falling back to IPv4-only");
+
+            let socket = Socket::new(Domain::IPV4, ty, Some(protocol))?;
+
+            if ty == Type::STREAM && !cfg!(windows) {
+                socket.set_reuse_address(true)?;
+            }
+
+            socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())?;
+
+            Ok(socket)
+        }
+    }
+}
+
+pub fn bind_tcp_listener(port: u16) -> Result<Socket> {
+    let socket = bind_dual_stack(port, Type::STREAM, Protocol::TCP)?;
+
+    // Same backlog used by std::net::TcpListener.
+    socket.listen(128)?;
+
+    Ok(socket)
+}
+
+pub fn bind_udp_socket(port: u16) -> Result<Socket> {
+    bind_dual_stack(port, Type::DGRAM, Protocol::UDP)
+}
+
+// A peer address must belong to the same address family as the local socket. An IPv4 peer reached
+// through a dual-stack socket has to be addressed as ::ffff:a.b.c.d, otherwise connect() fails with
+// EAFNOSUPPORT/EINVAL. This is the reason a naive "bind to ::" change breaks every IPv4 LAN user.
+pub fn adapt_peer_ip(local_is_ipv6: bool, peer: IpAddr) -> IpAddr {
+    match (local_is_ipv6, peer) {
+        (true, IpAddr::V4(addr)) => IpAddr::V6(addr.to_ipv6_mapped()),
+        (false, IpAddr::V6(addr)) => addr.to_ipv4_mapped().map_or(peer, IpAddr::V4),
+        _ => peer,
+    }
+}
+
+pub fn same_ip(a: IpAddr, b: IpAddr) -> bool {
+    a.to_canonical() == b.to_canonical()
+}
 
 fn set_socket_buffers(socket: &socket2::Socket, buffer_config: SocketBufferConfig) -> Result<()> {
     info!(
@@ -87,6 +154,13 @@ fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
             } => (class << 3) | drop_probability as u8,
             DscpTos::ExpeditedForwarding => 0b101110,
         };
+
+        // IP_TOS has no effect on an AF_INET6 socket and IPV6_TCLASS has none on AF_INET, so both
+        // are attempted and the inapplicable one is discarded. socket2 gates IPV6_TCLASS behind the
+        // "all" feature and does not expose it on Windows, leaving dual-stack sockets there
+        // unmarked.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        socket.set_tclass_v6((tos << 2) as u32).ok();
 
         socket.set_tos_v4((tos << 2) as u32).ok();
     }

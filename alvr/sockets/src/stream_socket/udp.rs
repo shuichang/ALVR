@@ -1,7 +1,6 @@
 use super::{
     MultiplexedSocketReader, MultiplexedSocketWriter, ReconstructedPacket, StreamRecvQueues,
 };
-use crate::LOCAL_IP;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result};
 use alvr_session::{DscpTos, SocketBufferConfig};
 use socket2::{MaybeUninitSlice, Socket};
@@ -42,7 +41,7 @@ pub fn bind(
     dscp: Option<DscpTos>,
     buffer_config: SocketBufferConfig,
 ) -> Result<UdpSocket> {
-    let socket = UdpSocket::bind((LOCAL_IP, port))?.into();
+    let socket = crate::bind_udp_socket(port)?;
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
     crate::set_dscp(&socket, dscp);
@@ -51,7 +50,9 @@ pub fn bind(
 }
 
 pub fn connect(socket: &UdpSocket, peer_ip: IpAddr, port: u16, timeout: Duration) -> Result<()> {
-    socket.connect((peer_ip, port))?;
+    let local_is_ipv6 = socket.local_addr()?.is_ipv6();
+
+    socket.connect((crate::adapt_peer_ip(local_is_ipv6, peer_ip), port))?;
     socket.set_read_timeout(Some(timeout))?;
 
     Ok(())
