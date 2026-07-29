@@ -26,7 +26,7 @@ use alvr_packets::{
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile, Settings,
-    SocketProtocol, SteamvrHmdInitConfig,
+    SocketBufferConfig, SocketProtocol, SteamvrHmdInitConfig,
 };
 use alvr_sockets::{
     CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, ProtoControlSocket, SocketConnection,
@@ -35,7 +35,7 @@ use alvr_sockets::{
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, TcpListener},
     process::Command,
     sync::{Arc, mpsc::RecvTimeoutError},
     thread,
@@ -46,6 +46,9 @@ const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// Video send errors happen per frame, so an unthrottled log would flood the file and become a
+// performance problem itself.
+const VIDEO_SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -274,7 +277,66 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
 
     let mut wired_connection = None;
 
+    // Kept unbound unless the feature is on: a client running on this same PC binds the control
+    // port itself, and taking it here would make that client fail to start.
+    let mut public_listener = None;
+    let mut public_listen_error_logged = false;
+
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
+        let public_listen_config = SESSION_MANAGER
+            .read()
+            .settings()
+            .connection
+            .public_listen
+            .clone();
+
+        match &public_listen_config {
+            Switch::Enabled(config) if config.shared_secret.is_empty() => {
+                public_listener = None;
+
+                if !public_listen_error_logged {
+                    error!(
+                        "Refusing to accept incoming connections: no shared secret is set. Set one in Settings > Connection > Accept incoming connections."
+                    );
+                    public_listen_error_logged = true;
+                }
+            }
+            Switch::Enabled(config) => {
+                if public_listener.is_none() {
+                    match alvr_sockets::bind(
+                        RETRY_CONNECT_MIN_INTERVAL,
+                        CONTROL_PORT,
+                        None,
+                        SocketBufferConfig::default(),
+                    ) {
+                        Ok(listener) => {
+                            info!("Accepting incoming connections on port {CONTROL_PORT}");
+                            public_listener = Some(listener);
+                            public_listen_error_logged = false;
+                        }
+                        Err(e) => {
+                            if !public_listen_error_logged {
+                                error!("Failed to listen on port {CONTROL_PORT}: {e:?}");
+                                public_listen_error_logged = true;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(listener) = &public_listener
+                    && let Err(e) =
+                        try_accept(&ctx, &lifecycle_state, listener, &config.shared_secret)
+                    && !matches!(e, ConnectionError::TryAgain(_))
+                {
+                    warn!("Incoming connection error: {e}");
+                }
+            }
+            Switch::Disabled => {
+                public_listener = None;
+                public_listen_error_logged = false;
+            }
+        }
+
         dbg_connection!("handshake_loop: Try connect to wired device");
 
         let mut wired_client_ips = HashMap::new();
@@ -493,7 +555,27 @@ fn try_connect(
         con_bail!("unreachable");
     };
 
-    dbg_connection!("try_connect: Pushing new client connection thread");
+    spawn_connection_thread(
+        ctx,
+        lifecycle_state,
+        socket,
+        connection_result,
+        client_hostname,
+        client_ip,
+    );
+
+    Ok(())
+}
+
+fn spawn_connection_thread(
+    ctx: Arc<ConnectionContext>,
+    lifecycle_state: Arc<RwLock<LifecycleState>>,
+    socket: ProtoControlSocket,
+    connection_result: ClientConnectionResult,
+    client_hostname: String,
+    client_ip: IpAddr,
+) {
+    dbg_connection!("spawn_connection_thread: Pushing new client connection thread");
 
     ctx.connection_threads.lock().push(thread::spawn({
         let ctx = Arc::clone(&ctx);
@@ -523,6 +605,105 @@ fn try_connect(
                 .update_client_connections(client_hostname, action);
         }
     }));
+}
+
+// The shared secret is the only credential guarding the control port when it is reachable from the
+// internet: the protocol has no encryption and no other authentication. The comparison never exits
+// early, so the time it takes doesn't reveal how much of the secret a guess got right.
+fn shared_secret_matches(expected: &str, received: &str) -> bool {
+    let (expected, received) = (expected.as_bytes(), received.as_bytes());
+
+    expected.len() == received.len()
+        && expected
+            .iter()
+            .zip(received)
+            .fold(0, |differing, (a, b)| differing | (a ^ b))
+            == 0
+}
+
+fn try_accept(
+    ctx: &Arc<ConnectionContext>,
+    lifecycle_state: &Arc<RwLock<LifecycleState>>,
+    listener: &TcpListener,
+    shared_secret: &str,
+) -> ConResult {
+    dbg_connection!("try_accept: Waiting for an incoming client");
+
+    let (socket, client_ip, connection_result) =
+        alvr_sockets::accept_from_client(listener, HANDSHAKE_ACTION_TIMEOUT)?;
+
+    let ClientConnectionResult::ConnectionAccepted(info) = &connection_result else {
+        dbg_connection!("try_accept: Incoming client is in standby");
+
+        return Ok(());
+    };
+
+    if !shared_secret_matches(shared_secret, &info.shared_secret) {
+        warn!("Rejected incoming connection from {client_ip}: wrong shared secret");
+
+        return Ok(());
+    }
+
+    // A dialing client states its own identity, since there is no manual IP entry to look it up by.
+    let client_hostname = info.hostname.clone();
+    if client_hostname.is_empty() {
+        warn!("Rejected incoming connection from {client_ip}: empty hostname");
+
+        return Ok(());
+    }
+
+    let trusted = {
+        let mut session_manager = SESSION_MANAGER.write();
+
+        let auto_trust_clients = session_manager
+            .settings()
+            .connection
+            .client_discovery
+            .as_option()
+            .is_some_and(|config| config.auto_trust_clients);
+
+        session_manager.update_client_connections(
+            client_hostname.clone(),
+            ClientConnectionsAction::AddIfMissing {
+                trusted: false,
+                manual_ips: vec![],
+            },
+        );
+
+        if auto_trust_clients {
+            session_manager
+                .update_client_connections(client_hostname.clone(), ClientConnectionsAction::Trust);
+        }
+
+        session_manager
+            .client_list()
+            .get(&client_hostname)
+            .is_some_and(|c| c.trusted)
+    };
+
+    if !trusted {
+        dbg_connection!("try_accept: Client {client_hostname} is not trusted");
+
+        return Ok(());
+    }
+
+    if !SESSION_MANAGER
+        .read()
+        .client_list()
+        .get(&client_hostname)
+        .is_some_and(|c| c.connection_state == ConnectionState::Disconnected)
+    {
+        return Ok(());
+    }
+
+    spawn_connection_thread(
+        Arc::clone(ctx),
+        Arc::clone(lifecycle_state),
+        socket,
+        connection_result,
+        client_hostname,
+        client_ip,
+    );
 
     Ok(())
 }
@@ -868,6 +1049,8 @@ fn connection_pipeline(
         let ctx = Arc::clone(&ctx);
         let client_hostname = client_hostname.clone();
         move || {
+            let mut send_error_log_deadline = Instant::now();
+
             while is_streaming(&client_hostname) {
                 let VideoPacket {
                     mut header,
@@ -883,9 +1066,13 @@ fn connection_pipeline(
                     .unrecenter_view_params(&mut header.global_view_params);
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                if let Err(e) = video_sender.send_header_with_payload(&header, &payload)
+                    && Instant::now() > send_error_log_deadline
+                {
+                    error!("Failed to send video packet: {e}");
+
+                    send_error_log_deadline = Instant::now() + VIDEO_SEND_ERROR_LOG_INTERVAL;
+                }
             }
         }
     });

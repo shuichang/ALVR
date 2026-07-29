@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     mem::{self, MaybeUninit},
     net::{IpAddr, UdpSocket},
-    ptr,
+    ptr, thread,
     time::Duration,
 };
 
@@ -49,11 +49,39 @@ pub fn bind(
     Ok(socket.into())
 }
 
-pub fn connect(socket: &UdpSocket, peer_ip: IpAddr, port: u16, timeout: Duration) -> Result<()> {
+// A client reached over the public internet sits behind a carrier stateful firewall that only lets
+// in datagrams belonging to a flow it has already seen leaving. Nothing is sent on this socket
+// before the server starts streaming, so the pinhole is opened explicitly here. Several datagrams
+// are sent because losing the only one would silently kill the whole video stream.
+const HOLE_PUNCH_DATAGRAMS_COUNT: usize = 5;
+const HOLE_PUNCH_INTERVAL: Duration = Duration::from_millis(5);
+
+// Shorter than SHARD_PREFIX_SIZE, so the peer drops it through the existing malformed-shard path in
+// MultiplexedUdpReader::recv without touching any stream state. Reusing that path keeps the wire
+// protocol unchanged.
+const HOLE_PUNCH_PAYLOAD: &[u8] = &[0];
+
+pub fn connect(
+    socket: &UdpSocket,
+    peer_ip: IpAddr,
+    port: u16,
+    timeout: Duration,
+    punch_hole: bool,
+) -> Result<()> {
     let local_is_ipv6 = socket.local_addr()?.is_ipv6();
 
     socket.connect((crate::adapt_peer_ip(local_is_ipv6, peer_ip), port))?;
     socket.set_read_timeout(Some(timeout))?;
+
+    if punch_hole {
+        for _ in 0..HOLE_PUNCH_DATAGRAMS_COUNT {
+            // Best effort: the peer may not have bound its socket yet, and a refused datagram must
+            // not fail a connection that works on a LAN anyway.
+            socket.send(HOLE_PUNCH_PAYLOAD).ok();
+
+            thread::sleep(HOLE_PUNCH_INTERVAL);
+        }
+    }
 
     Ok(())
 }

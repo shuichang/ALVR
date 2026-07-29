@@ -20,8 +20,8 @@ use alvr_packets::{
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
-    ControlSocketSender, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
-    StreamSender, StreamSocketBuilder,
+    CONTROL_PORT, ControlSocketSender, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType,
+    ProtoControlSocket, StreamSender, StreamSocketBuilder,
 };
 use std::{
     collections::VecDeque,
@@ -50,6 +50,12 @@ const SOCKET_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+// The encoder emits a single IDR at stream start and has no periodic keyframe, so a lost IDR
+// leaves the decoder with nothing to start from until we ask for another one.
+const IDR_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+// Requesting is cheap, but an idle headset stalls video indefinitely, so the log is throttled
+// separately to keep a long stall from burying real errors.
+const IDR_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -128,8 +134,9 @@ fn connection_pipeline(
 ) -> ConResult {
     dbg_connection!("connection_pipeline: Begin");
 
+    let config = Config::load();
+
     let (mut proto_control_socket, server_ip) = {
-        let config = Config::load();
         let announcer_socket = AnnouncerSocket::new(&config.hostname).to_con()?;
         let listener_socket =
             alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
@@ -140,6 +147,22 @@ fn connection_pipeline(
             }
 
             announcer_socket.announce().ok();
+
+            // Dialing out is the only way in when the headset sits behind a carrier firewall that
+            // drops unsolicited inbound connections. Attempted before discovery so that a single
+            // build works both remotely and on the LAN.
+            if let Some(server_hostname) =
+                option_env!("ALVR_STREAMER_ADDRESS").filter(|address| !address.is_empty())
+                && let Ok(addresses) =
+                    alvr_sockets::resolve_server_addresses(server_hostname, CONTROL_PORT)
+                && let Ok(pair) = ProtoControlSocket::connect_to(
+                    SOCKET_INIT_RETRY_INTERVAL,
+                    PeerType::ServerAddresses(addresses),
+                )
+            {
+                set_hud_message(&event_queue, SUCCESS_CONNECT_MESSAGE);
+                break pair;
+            }
 
             if let Ok(pair) = ProtoControlSocket::connect_to(
                 SOCKET_INIT_RETRY_INTERVAL,
@@ -165,6 +188,10 @@ fn connection_pipeline(
         .send(&ClientConnectionResult::ConnectionAccepted(Box::new(
             ConnectionAcceptedInfo {
                 client_protocol_id: alvr_common::protocol_id_u64(),
+                hostname: config.hostname.clone(),
+                shared_secret: option_env!("ALVR_SHARED_SECRET")
+                    .unwrap_or_default()
+                    .to_owned(),
                 platform_string: capabilities.platform.to_string(),
                 server_ip,
                 streaming_capabilities: Some(
@@ -275,7 +302,23 @@ fn connection_pipeline(
         let ctx = Arc::clone(&ctx);
         move || {
             let mut stream_corrupted = true;
+            let mut idr_request_deadline = Instant::now() + IDR_REQUEST_INTERVAL;
+            let mut idr_warn_deadline = Instant::now();
             while is_streaming(&ctx) {
+                if Instant::now() > idr_request_deadline {
+                    if let Some(sender) = &mut *ctx.control_sender.lock() {
+                        sender.send(&ClientControlPacket::RequestIdr).ok();
+                    }
+
+                    idr_request_deadline = Instant::now() + IDR_REQUEST_INTERVAL;
+
+                    if Instant::now() > idr_warn_deadline {
+                        warn!("No video frame received. Requesting IDR frame");
+
+                        idr_warn_deadline = Instant::now() + IDR_WARN_INTERVAL;
+                    }
+                }
+
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
                     Err(ConnectionError::TryAgain(_)) => continue,
@@ -284,6 +327,8 @@ fn connection_pipeline(
                 let Ok((header, nal)) = data.get() else {
                     return;
                 };
+
+                idr_request_deadline = Instant::now() + IDR_REQUEST_INTERVAL;
 
                 if let Some(stats) = &mut *ctx.statistics_manager.lock() {
                     stats.report_video_packet_received(header.timestamp);

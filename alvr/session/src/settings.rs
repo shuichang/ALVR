@@ -1353,6 +1353,15 @@ pub struct DiscoveryConfig {
     pub auto_trust_clients: bool,
 }
 
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct PublicListenConfig {
+    #[schema(strings(
+        display_name = "Shared secret",
+        help = r#"Required. Clients must present this exact string to be accepted. Without it the only credential protecting this port is the client's 4-digit hostname, which has just 10000 possible values and is trivially brute-forced over the internet. Use a long random string."#
+    ))]
+    pub shared_secret: String,
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, Default)]
 pub enum SocketBufferSize {
     #[default]
@@ -1386,6 +1395,14 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     pub stream_protocol: SocketProtocol,
 
     pub client_discovery: Switch<DiscoveryConfig>,
+
+    #[schema(strings(
+        display_name = "Accept incoming connections",
+        help = r#"Listen for clients dialing in, instead of ALVR dialing out to them. Needed when the headset is behind a firewall or CGNAT that blocks inbound connections, such as on mobile data or a remote network.
+
+SECURITY: this exposes a port to whatever network you forward it from. The ALVR protocol has no encryption. Only enable this with a strong shared secret, and prefer restricting the port to known source addresses in your firewall."#
+    ))]
+    pub public_listen: Switch<PublicListenConfig>,
 
     #[schema(strings(
         help = r#"Which release type of client should ALVR look for when establishing a wired connection."#
@@ -2152,6 +2169,12 @@ pub fn session_settings_default() -> SettingsDefault {
                 enabled: true,
                 content: DiscoveryConfigDefault {
                     auto_trust_clients: cfg!(debug_assertions),
+                },
+            },
+            public_listen: SwitchDefault {
+                enabled: false,
+                content: PublicListenConfigDefault {
+                    shared_secret: String::new(),
                 },
             },
             wired_client_type: ClientFlavorDefault {

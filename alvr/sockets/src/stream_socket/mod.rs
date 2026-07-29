@@ -275,7 +275,7 @@ impl StreamSocketBuilder {
     ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match self {
             StreamSocketBuilder::Udp(socket) => {
-                udp::connect(&socket, server_ip, port, timeout).to_con()?;
+                udp::connect(&socket, server_ip, port, timeout, true).to_con()?;
                 udp::split_multiplexed(socket, max_packet_size).to_con()?
             }
             StreamSocketBuilder::Tcp(listener) => {
@@ -304,7 +304,7 @@ impl StreamSocketBuilder {
         let (send_socket, receive_socket) = match protocol {
             SocketProtocol::Udp => {
                 let socket = udp::bind(port, dscp, buffer_config).to_con()?;
-                udp::connect(&socket, client_ip, port, timeout).to_con()?;
+                udp::connect(&socket, client_ip, port, timeout, false).to_con()?;
                 udp::split_multiplexed(socket, max_packet_size).to_con()?
             }
             SocketProtocol::Tcp => {

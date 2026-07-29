@@ -14,6 +14,11 @@ use std::{
 // This corresponds to the length of the payload
 const FRAMED_PREFIX_LENGTH: usize = mem::size_of::<u32>();
 
+// The length prefix is attacker-controlled, so an unbounded resize below lets a single unauthorized
+// packet request a 4GiB allocation. The largest legitimate control payload is the settings blob,
+// which is orders of magnitude smaller than this cap.
+const MAX_FRAMED_PAYLOAD_LENGTH: usize = 16 * 1024 * 1024;
+
 pub fn bind(
     timeout: Duration,
     port: u16,
@@ -83,6 +88,44 @@ pub fn connect_to_client(
     Ok((socket.try_clone().to_con()?, socket))
 }
 
+pub fn accept_from_client(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> ConResult<(TcpStream, TcpStream)> {
+    accept_from_server(listener, None, timeout)
+}
+
+pub fn connect_to_server(
+    timeout: Duration,
+    server_addresses: &[SocketAddr],
+    buffer_config: SocketBufferConfig,
+) -> ConResult<(TcpStream, TcpStream)> {
+    if server_addresses.is_empty() {
+        con_bail!("No server address to connect to");
+    }
+
+    let split_timeout = timeout / server_addresses.len() as u32;
+
+    let mut res = alvr_common::try_again();
+    for address in server_addresses {
+        res = TcpStream::connect_timeout(address, split_timeout).handle_try_again();
+
+        if res.is_ok() {
+            break;
+        }
+    }
+    let socket = res?.into();
+
+    crate::set_socket_buffers(&socket, buffer_config).ok();
+    socket.set_read_timeout(Some(timeout)).to_con()?;
+
+    let socket = TcpStream::from(socket);
+
+    socket.set_nodelay(true).to_con()?;
+
+    Ok((socket.try_clone().to_con()?, socket))
+}
+
 fn framed_send<S: Serialize>(
     socket: &mut TcpStream,
     buffer: &mut Vec<u8>,
@@ -121,7 +164,12 @@ fn framed_recv<R: DeserializeOwned>(
             }
         }
 
-        let size = FRAMED_PREFIX_LENGTH + u32::from_le_bytes(payload_size_bytes) as usize;
+        let payload_size = u32::from_le_bytes(payload_size_bytes) as usize;
+        if payload_size > MAX_FRAMED_PAYLOAD_LENGTH {
+            con_bail!("Control packet size {payload_size} exceeds the maximum allowed");
+        }
+
+        let size = FRAMED_PREFIX_LENGTH + payload_size;
         buffer.resize(size, 0);
 
         recv_cursor.insert(0)
@@ -193,6 +241,11 @@ pub struct ProtoControlSocket {
 pub enum PeerType<'a> {
     AnyClient(Vec<IpAddr>),
     Server(&'a TcpListener),
+    // Reversed-direction counterparts of the two variants above. A headset reached over the public
+    // internet sits behind a carrier stateful firewall that drops unsolicited inbound connections,
+    // so the client has to be the side that dials out. The handshake message order is unaffected.
+    ServerAddresses(Vec<SocketAddr>),
+    IncomingClient(&'a TcpListener),
 }
 
 impl ProtoControlSocket {
@@ -202,6 +255,10 @@ impl ProtoControlSocket {
                 connect_to_client(timeout, &ips, CONTROL_PORT, SocketBufferConfig::default())?.0
             }
             PeerType::Server(listener) => accept_from_server(listener, None, timeout)?.0,
+            PeerType::ServerAddresses(addresses) => {
+                connect_to_server(timeout, &addresses, SocketBufferConfig::default())?.0
+            }
+            PeerType::IncomingClient(listener) => accept_from_client(listener, timeout)?.0,
         };
 
         let peer_ip = socket.peer_addr().to_con()?.ip();

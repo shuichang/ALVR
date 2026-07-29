@@ -8,7 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     marker::PhantomData,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     time::Duration,
 };
 
@@ -189,6 +189,55 @@ pub fn listen_to_server<T: DeserializeOwned>(
 ) -> ConResult<(ProtoControlSocket, T)> {
     let (mut control_socket, _) =
         ProtoControlSocket::connect_to(timeout, PeerType::Server(listener_socket))?;
+
+    control_socket.send(client_info).to_con()?;
+
+    let config_packet = control_socket.recv(timeout)?;
+
+    Ok((control_socket, config_packet))
+}
+
+pub fn accept_from_client<T: DeserializeOwned>(
+    listener_socket: &TcpListener,
+    timeout: Duration,
+) -> ConResult<(ProtoControlSocket, IpAddr, T)> {
+    let (mut control_socket, client_ip) =
+        ProtoControlSocket::connect_to(timeout, PeerType::IncomingClient(listener_socket))?;
+
+    let res = control_socket.recv(timeout)?;
+
+    Ok((control_socket, client_ip, res))
+}
+
+// IPv6 candidates are tried first because this path exists for public-internet streaming, which
+// only works over IPv6: a dynamic DNS name that also carries an A record would otherwise spend part
+// of the connection timeout on an unreachable IPv4 address.
+pub fn resolve_server_addresses(server_hostname: &str, port: u16) -> ConResult<Vec<SocketAddr>> {
+    let mut addresses = (server_hostname, port)
+        .to_socket_addrs()
+        .to_con()?
+        .collect::<Vec<_>>();
+
+    if addresses.is_empty() {
+        con_bail!("Could not resolve any address for {server_hostname}");
+    }
+
+    addresses.sort_by_key(|address| address.is_ipv4());
+
+    Ok(addresses)
+}
+
+// The hostname is resolved here rather than by the caller, so that a dynamic DNS name that changed
+// address since the last connection attempt is picked up.
+pub fn connect_to_server<T: DeserializeOwned>(
+    server_hostname: &str,
+    timeout: Duration,
+    client_info: &impl Serialize,
+) -> ConResult<(ProtoControlSocket, T)> {
+    let server_addresses = resolve_server_addresses(server_hostname, CONTROL_PORT)?;
+
+    let (mut control_socket, _) =
+        ProtoControlSocket::connect_to(timeout, PeerType::ServerAddresses(server_addresses))?;
 
     control_socket.send(client_info).to_con()?;
 
